@@ -301,7 +301,8 @@ class SessionEngine:
                  session["id"], agent, role, phase["name"])
 
         try:
-            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt,
+                                       session_id=session["id"])
         except Exception as exc:
             log.error("Session %d: failed to trigger %s: %s",
                       session["id"], agent, exc)

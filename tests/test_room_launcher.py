@@ -26,6 +26,8 @@ class RoomLauncherTests(unittest.TestCase):
         self.assertEqual(codex[-4:], ["--sandbox", "workspace-write", "--ask-for-approval", "untrusted"])
         self.assertEqual(room.agent_args("codex", cwd, "account-model")[-2:],
                          ["--model", "account-model"])
+        dsh = room.agent_args("dsh", cwd)
+        self.assertEqual(dsh[1:], [str(ROOT / "wrapper_api.py"), "dsh", "--cwd", str(cwd)])
 
     def test_launch_quotes_shell_metacharacters_without_interpolation(self):
         import shlex

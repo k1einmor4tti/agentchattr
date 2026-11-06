@@ -1,4 +1,4 @@
-"""Local Claude/Codex room launcher. Uses existing CLI logins and approvals."""
+"""Local Claude/Codex/DSH room launcher. Uses existing logins and approvals."""
 
 import argparse
 import json
@@ -42,6 +42,8 @@ def launch(name, argv, cwd):
 
 
 def agent_args(agent, cwd, codex_model=None):
+    if agent == "dsh":
+        return [sys.executable, str(ROOT / "wrapper_api.py"), "dsh", "--cwd", str(cwd)]
     args = [sys.executable, str(ROOT / "wrapper.py"), agent, "--no-restart", "--cwd", str(cwd)]
     if agent == "claude":
         return args + ["--permission-mode", "default"]
@@ -66,6 +68,8 @@ def start(agents, cwd, codex_model=None):
     if not cwd.is_dir():
         raise RuntimeError(f"Working directory does not exist: {cwd}")
     for command in agents:
+        if command == "dsh":
+            continue
         if not shutil.which(command):
             raise RuntimeError(f"Install and log into {command} first.")
         if any(n == f"agentchattr-{command}" or n.startswith(f"agentchattr-{command}-")
@@ -80,6 +84,10 @@ def start(agents, cwd, codex_model=None):
                 raise RuntimeError(f"Port {port} is in use; leaving that service untouched.") from None
     from config_loader import load_config
     config = load_config(ROOT)
+    if "dsh" in agents:
+        from dsh_bridge import DshBridge
+        DshBridge(config["agents"]["dsh"]["base_url"],
+                  ROOT / "data" / "dsh-dsh-sessions.json", cwd).rpc("host.describe", {})
     if config.get("server", {}).get("host", "127.0.0.1") != "127.0.0.1":
         raise RuntimeError("This launcher requires server.host = 127.0.0.1.")
     configured = (config["server"]["port"], config["mcp"]["http_port"], config["mcp"]["sse_port"])
@@ -114,6 +122,12 @@ def start(agents, cwd, codex_model=None):
             before = agent_sessions()
             launch(wrapper, agent_args(agent, cwd, codex_model), ROOT)
             remember(wrapper)
+            if agent == "dsh":
+                # DSH is an existing HTTP host, not a nested CLI session.
+                time.sleep(1)
+                if not alive(wrapper):
+                    raise RuntimeError("DSH bridge exited during startup.")
+                continue
             # Registration may allocate a suffixed identity; record only sessions
             # that appeared during our launch, never a pre-existing session.
             for _ in range(40):
@@ -132,7 +146,7 @@ def start(agents, cwd, codex_model=None):
         stop(state)
         raise
     print("Room: http://127.0.0.1:8300")
-    print("Use @claude / @codex in chat. Review trust/approval prompts with:")
+    print("Mention " + " / ".join("@" + a for a in agents) + " in chat. Agent terminals:")
     for agent in agents:
         print(f"  tmux -L agentchattr-room attach -t {PREFIX}{agent}")
     print("Detach: Ctrl+B, D. Stop: .venv/bin/python room.py stop")
@@ -144,7 +158,7 @@ def main():
     preferences = tomllib.loads(local.read_text()).get("room", {}) if local.exists() else {}
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("start", "status", "stop"))
-    parser.add_argument("--agents", nargs="+", choices=("claude", "codex"), default=["claude", "codex"])
+    parser.add_argument("--agents", nargs="+", choices=("claude", "codex", "dsh"), default=["claude", "codex"])
     parser.add_argument("--cwd", type=Path, default=ROOT / "data" / "workspace")
     parser.add_argument("--codex-model", default=preferences.get("codex_model"),
                         help="Optional model override for this room only")

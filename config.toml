@@ -19,6 +19,14 @@ cwd = ".."
 color = "#10a37f"
 label = "Codex"
 
+# Reuses an existing local DeepSeek Harness host; no new model credentials.
+[agents.dsh]
+type = "dsh"
+base_url = "http://127.0.0.1:3080"
+cwd = "data/workspace"
+color = "#647eff"
+label = "DSH"
+
 [agents.gemini]
 command = "gemini"
 cwd = ".."

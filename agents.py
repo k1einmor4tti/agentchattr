@@ -47,6 +47,8 @@ class AgentTrigger:
             entry["prompt"] = custom_prompt.strip()
         if job_id is not None:
             entry["job_id"] = job_id
+        if kwargs.get("session_id") is not None:
+            entry["session_id"] = kwargs["session_id"]
 
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
@@ -71,6 +73,8 @@ class AgentTrigger:
             entry["prompt"] = custom_prompt.strip()
         if job_id is not None:
             entry["job_id"] = job_id
+        if kwargs.get("session_id") is not None:
+            entry["session_id"] = kwargs["session_id"]
 
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")

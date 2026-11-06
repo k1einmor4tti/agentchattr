@@ -26,6 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -48,7 +49,7 @@ def main():
     apply_cli_overrides()
     config = load_config(ROOT)
     agent_names = list(config.get("agents", {}).keys())
-    api_agents = [n for n in agent_names if config["agents"][n].get("type") == "api"]
+    api_agents = [n for n in agent_names if config["agents"][n].get("type") in ("api", "dsh")]
 
     if not api_agents:
         print("  No API agents found in config.\n")
@@ -62,6 +63,7 @@ def main():
     parser.add_argument("agent", choices=api_agents,
                         help=f"API agent to run ({', '.join(api_agents)})")
     parser.add_argument("--label", type=str, default=None, help="Custom display label")
+    parser.add_argument("--cwd", type=Path, default=None, help="Workspace for new DSH sessions")
     # Per-project isolation flags (consumed by apply_cli_overrides above;
     # listed here so --help shows them and argparse doesn't error on them).
     parser.add_argument("--data-dir",      default=None, help="Override server.data_dir (path)")
@@ -73,12 +75,13 @@ def main():
 
     agent = args.agent
     agent_cfg = config["agents"][agent]
+    is_dsh = agent_cfg.get("type") == "dsh"
     server_port = config.get("server", {}).get("port", 8300)
     data_dir = ROOT / config.get("server", {}).get("data_dir", "./data")
     data_dir.mkdir(parents=True, exist_ok=True)
 
     # Model API config
-    base_url = agent_cfg.get("base_url", "").rstrip("/")
+    base_url = agent_cfg.get("base_url", "http://127.0.0.1:3080" if is_dsh else "").rstrip("/")
     if not base_url:
         print(f"  Error: [agents.{agent}] must have base_url (e.g. http://localhost:8189/v1)")
         sys.exit(1)
@@ -99,6 +102,17 @@ def main():
         "in a developer chat room. Keep responses concise and relevant. "
         "You can see recent messages for context.")
 
+    dsh = None
+    if is_dsh:
+        from dsh_bridge import DshBridge
+        cwd = args.cwd.resolve() if args.cwd else (ROOT / agent_cfg.get("cwd", "data/workspace")).resolve()
+        if not cwd.is_dir():
+            parser.error(f"DSH working directory does not exist: {cwd}")
+        dsh = DshBridge(base_url, data_dir / f"{agent}-dsh-sessions.json", cwd,
+                        preset=agent_cfg.get("agent_preset", "standard"),
+                        timeout=float(agent_cfg.get("timeout", 900)))
+        dsh.rpc("host.describe", {})
+
     # Register with server
     try:
         registration = _register_instance(server_port, agent, args.label)
@@ -109,6 +123,11 @@ def main():
 
     name = registration["name"]
     token = registration["token"]
+    if dsh is not None and name != agent:
+        # Each registered instance owns its own DSH session bindings.
+        dsh = DshBridge(base_url, data_dir / f"{name}-dsh-sessions.json", cwd,
+                        preset=agent_cfg.get("agent_preset", "standard"),
+                        timeout=float(agent_cfg.get("timeout", 900)))
     print(f"  Registered as: {name} (slot {registration.get('slot', '?')})")
 
     # Thread-safe identity state (can change via heartbeat rename)
@@ -172,6 +191,9 @@ def main():
 
     # Get this agent's role from server status
     def get_my_role():
+        if is_dsh:
+            from wrapper import _fetch_role
+            return _fetch_role(server_port, get_name())
         try:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{server_port}/api/status",
@@ -202,7 +224,7 @@ def main():
 
     # Read recent messages from chat server
     def read_messages(channel="general", since_id=0, limit=20):
-        params = f"limit={limit}&channel={channel}"
+        params = urllib.parse.urlencode({"limit": limit, "channel": channel})
         if since_id:
             params = f"since_id={since_id}&{params}"
         req = urllib.request.Request(
@@ -273,7 +295,7 @@ def main():
         return messages
 
     # Handle a trigger — read context, call model, respond
-    def handle_trigger(channel="general"):
+    def handle_trigger(channel="general", instruction="", session_id=None):
         my_name = get_name()
         set_working(True)
         try:
@@ -284,7 +306,12 @@ def main():
             messages = format_messages(chat_msgs)
             print(f"  [{channel}] Calling model with {len(messages)} messages...")
 
-            response = call_model(messages)
+            if dsh is not None:
+                from dsh_bridge import room_prompt
+                scope = f"#{channel}" + (f" / review-{session_id}" if session_id is not None else "")
+                response = dsh.ask(scope, room_prompt(messages, instruction))
+            else:
+                response = call_model(messages)
             response = response.strip()
             if not response:
                 return
@@ -309,11 +336,21 @@ def main():
         queue_file.write_text("", "utf-8")
 
     print(f"\n  === {agent_cfg.get('label', agent)} API Wrapper ===")
-    print(f"  Model endpoint: {base_url}/chat/completions")
+    print(f"  DSH session RPC: {base_url}" if is_dsh else f"  Model endpoint: {base_url}/chat/completions")
+    if is_dsh:
+        print("  Approve tools in the existing DSH UI; stopping the wrapper does not cancel DSH work.")
     if model:
         print(f"  Model: {model}")
     print(f"  @{name} mentions trigger model calls")
     print(f"  Ctrl+C to stop\n")
+
+    if is_dsh:
+        import signal
+        def shutdown(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, shutdown)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, shutdown)
 
     try:
         while True:
@@ -327,7 +364,7 @@ def main():
                         lines = f.readlines()
                     qf.write_text("", "utf-8")
 
-                    channels_triggered = set()
+                    channels_triggered = {}
                     for line in lines:
                         line = line.strip()
                         if not line:
@@ -335,12 +372,16 @@ def main():
                         try:
                             data = json.loads(line)
                             ch = data.get("channel", "general") if isinstance(data, dict) else "general"
-                            channels_triggered.add(ch)
+                            if is_dsh and isinstance(data, dict) and data.get("job_id") is not None:
+                                print("  DSH job threads are not supported; use a dedicated channel.", flush=True)
+                                continue
+                            scope = (ch, data.get("session_id")) if isinstance(data, dict) else (ch, None)
+                            channels_triggered[scope] = data.get("prompt", "") if isinstance(data, dict) else ""
                         except json.JSONDecodeError:
-                            channels_triggered.add("general")
+                            channels_triggered[("general", None)] = ""
 
-                    for ch in channels_triggered:
-                        handle_trigger(channel=ch)
+                    for (ch, session_id), instruction in channels_triggered.items():
+                        handle_trigger(channel=ch, instruction=instruction, session_id=session_id)
             except Exception:
                 pass
 
